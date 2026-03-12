@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OT & CRDT Collaborative Editor Demo</title>
+  <link rel="stylesheet" href="/shared.css" />
+</head>
+<body>
+  <div class="landing">
+    <h1>OT vs CRDT</h1>
+    <p class="tagline">
+      A hands-on learning demo of <strong>Operational Transformation</strong> and
+      <strong>Conflict-free Replicated Data Types</strong> — the two main approaches
+      to real-time collaborative text editing.
+    </p>
+
+    <div class="demo-cards">
+      <a href="/ot" class="demo-card ot-card">
+        <div class="icon">⚡</div>
+        <h2>Operational Transformation</h2>
+        <p>
+          Server-centric approach. Operations are transformed on the server
+          to resolve conflicts. Used by Google Docs (early architecture).
+        </p>
+        <div class="cta">Open OT Demo →</div>
+      </a>
+
+      <a href="/crdt" class="demo-card crdt-card">
+        <div class="icon">🔗</div>
+        <h2>CRDT — Logoot</h2>
+        <p>
+          Peer-to-peer approach. Each character has a unique stable ID.
+          No transformation needed. Used by Figma, Notion, Automerge.
+        </p>
+        <div class="cta">Open CRDT Demo →</div>
+      </a>
+    </div>
+  </div>
+</body>
+</html>
+

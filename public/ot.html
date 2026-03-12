@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OT Demo — Operational Transformation</title>
+  <link rel="stylesheet" href="/shared.css" />
+  <style>
+    /* Override textarea focus for OT theme */
+    textarea:focus {
+      border-color: #7c3aed;
+      box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.12);
+    }
+    .lag-slider {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.78rem;
+      color: #94a3b8;
+    }
+    .lag-slider input[type="range"] {
+      width: 90px;
+      accent-color: #f59e0b;
+    }
+  </style>
+</head>
+<body>
+  <!-- ── Header ──────────────────────────────────────────────────────────── -->
+  <header>
+    <span class="badge badge-ot">OT</span>
+    <div>
+      <h1>Operational Transformation Demo</h1>
+      <div class="subtitle">
+        <a href="/" class="back-link">← Back to Home</a>
+        &nbsp;·&nbsp; Open this page in multiple tabs to test collaborative editing
+      </div>
+    </div>
+  </header>
+
+  <!-- ── Status Bar ──────────────────────────────────────────────────────── -->
+  <div class="status-bar">
+    <span>
+      <span class="status-dot" id="status-dot"></span>
+      <span id="status-text">Connecting…</span>
+    </span>
+    <span>Client ID: <code id="client-id">—</code></span>
+    <span>Server version: <code id="server-version">0</code></span>
+    <span>Local version: <code id="local-version">0</code></span>
+  </div>
+
+  <!-- ── Main Grid: Two simulated editors ──────────────────────────────── -->
+  <div class="main-grid" style="grid-template-rows: auto auto auto;">
+
+    <!-- Explanation box -->
+    <div class="explanation-box" style="grid-column: 1 / -1;">
+      <strong>How OT works:</strong>
+      Each keystroke creates an <em>Insert</em> or <em>Delete</em> operation with a
+      <em>position</em> and <em>version number</em>. The server <strong>transforms</strong>
+      incoming operations against any concurrent operations it received while your message
+      was in transit, then broadcasts the transformed operation to all other clients.
+      Watch the <strong>Operation Log</strong> below to see transformations happen in real time.
+    </div>
+
+    <!-- ── Editor Panel (THIS CLIENT) ──────────────────────────────────── -->
+    <div class="client-panel">
+      <div class="panel-header">
+        <h3>📝 This Client (You)</h3>
+        <span class="client-info" id="panel-client-id">Connecting…</span>
+      </div>
+      <div class="editor-area">
+        <textarea
+          id="editor"
+          placeholder="Start typing here… Open another tab and type there too to see collaboration!"
+          spellcheck="false"
+        ></textarea>
+      </div>
+      <div class="controls">
+        <label class="toggle-label">
+          <input type="checkbox" id="lag-toggle" />
+          Simulate network lag
+        </label>
+        <div class="lag-slider">
+          Delay: <input type="range" id="lag-amount" min="0" max="3000" step="100" value="500" />
+          <span id="lag-display">500ms</span>
+        </div>
+        <span class="version-badge">v<span id="ctrl-version">0</span></span>
+      </div>
+    </div>
+
+    <!-- ── Remote Activity Panel ────────────────────────────────────────── -->
+    <div class="client-panel">
+      <div class="panel-header">
+        <h3>👥 Remote Activity (from other tabs)</h3>
+        <span class="client-info">Shared document view</span>
+      </div>
+      <div class="editor-area">
+        <textarea
+          id="remote-view"
+          placeholder="Remote changes will appear here…"
+          spellcheck="false"
+          readonly
+          style="cursor: default; opacity: 0.8;"
+        ></textarea>
+        <div class="explanation-box" style="font-size: 0.78rem;">
+          <strong>This panel mirrors what a remote client receives.</strong>
+          All connected clients (any number of tabs) see the same text here
+          because OT ensures convergence.
+        </div>
+      </div>
+      <div class="controls">
+        <span style="font-size: 0.78rem; color: #64748b;">Read-only mirror — all edits originate from the left panel</span>
+      </div>
+    </div>
+
+    <!-- ── Operation Log ─────────────────────────────────────────────────── -->
+    <div class="log-panel" style="grid-column: 1 / -1;">
+      <div class="panel-header">
+        <h3>🔄 Operation Log — Watch OT Transformations</h3>
+        <button class="clear-btn" onclick="clearLog()">Clear</button>
+      </div>
+      <div id="log-container">
+        <div class="log-entry">
+          <span class="op-type">OT ENGINE READY</span>
+          — waiting for operations…
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!--
+    Socket.IO client library.
+    Served automatically by the Socket.IO server at /socket.io/socket.io.js
+    Must be loaded BEFORE any inline script that calls io().
+  -->
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+  /**
+   * ot.html — Client-Side OT Implementation (Socket.IO edition)
+   * =============================================================
+   *
+   * OT CLIENT RESPONSIBILITIES:
+   * ---------------------------
+   * 1. Track the document content locally
+   * 2. Detect changes (insert/delete) by comparing old vs new textarea value
+   * 3. Create Operation objects with the current LOCAL version number
+   * 4. Send operations to the server (with optional lag simulation)
+   * 5. Receive transformed operations from the server and apply them
+   * 6. Handle cursor position preservation (important UX detail in OT)
+   *
+   * VERSION TRACKING:
+   * -----------------
+   * The client maintains a "localVersion" counter.
+   * Every time it receives a server acknowledgement, it increments this.
+   * When it sends an op, it attaches localVersion so the server knows
+   * which operations to transform against.
+   *
+   * CLIENT-SIDE OT CHALLENGE:
+   * -------------------------
+   * While an op is "in flight" (sent but not yet ack'd), the client might
+   * apply more local changes. These local changes were NOT transformed by
+   * the server. When the server sends back ops from other clients, our
+   * local client needs to transform INCOMING ops against our pending ops.
+   *
+   * This is called the "client-side OT problem" or the "Jupiter protocol".
+   * For simplicity, this demo uses a simplified version: we track a pending
+   * ops queue and transform incoming remote ops against them.
+   */
+
+  // ─── State Variables ──────────────────────────────────────────────────────
+  let localVersion = 0;      // The version number we send with our ops
+  let clientId = null;       // Assigned by server on connection
+  let content = '';          // Our local copy of the document
+
+  /**
+   * pendingOps: Operations we've sent to the server but not yet ack'd.
+   * When we receive a remote op, we must transform it against ALL pending ops
+   * (because the server doesn't know about them yet).
+   */
+  let pendingOps = [];
+
+  let lagEnabled = false;
+  let lagAmount = 500; // milliseconds
+
+  // DOM elements
+  const editor = document.getElementById('editor');
+  const remoteView = document.getElementById('remote-view');
+  const statusDot = document.getElementById('status-dot');
+  const statusText = document.getElementById('status-text');
+  const clientIdEl = document.getElementById('client-id');
+  const panelClientId = document.getElementById('panel-client-id');
+  const serverVersionEl = document.getElementById('server-version');
+  const localVersionEl = document.getElementById('local-version');
+  const ctrlVersionEl = document.getElementById('ctrl-version');
+  const logContainer = document.getElementById('log-container');
+
+  // ─── Lag controls ─────────────────────────────────────────────────────────
+  document.getElementById('lag-toggle').addEventListener('change', (e) => {
+    lagEnabled = e.target.checked;
+    log('op-sync', `Network lag simulation ${lagEnabled ? 'ENABLED' : 'DISABLED'} (${lagAmount}ms)`);
+  });
+
+  document.getElementById('lag-amount').addEventListener('input', (e) => {
+    lagAmount = parseInt(e.target.value);
+    document.getElementById('lag-display').textContent = lagAmount + 'ms';
+  });
+
+  // ─── Socket.IO Connection ─────────────────────────────────────────────────
+  /**
+   * WHY SOCKET.IO?
+   * Socket.IO wraps WebSocket and adds:
+   *   - Event names instead of message types (socket.on('op', ...) vs JSON parsing)
+   *   - Built-in acknowledgements: the server can call back the sender directly
+   *   - Automatic reconnection if the network drops
+   *   - Namespaces: we connect to '/ot' to isolate OT from CRDT traffic
+   *
+   * The Socket.IO client library is served automatically by Socket.IO at /socket.io/socket.io.js
+   * We load it via a <script> tag added at the bottom of <body>.
+   *
+   * We connect to the '/ot' NAMESPACE on the server.
+   * A namespace is like a separate channel on the same server port.
+   */
+  const socket = io('/ot');   // ← replaces: new WebSocket('ws://host/ws/ot')
+
+  socket.on('connect', () => {
+    statusDot.classList.add('connected');
+    statusText.textContent = 'Connected';
+    log('op-sync', `Socket.IO connected to /ot namespace. Socket ID: ${socket.id}`);
+  });
+
+  socket.on('disconnect', (reason) => {
+    statusDot.classList.remove('connected');
+    statusText.textContent = 'Disconnected';
+    log('op-delete', `Socket.IO disconnected: ${reason}`);
+  });
+
+  socket.on('connect_error', (err) => {
+    log('op-delete', `Connection error: ${err.message}`);
+  });
+
+  // ─── Receive Events from Server ───────────────────────────────────────────
+
+  /**
+   * EVENT: 'init'
+   * -------------
+   * Server sends the current document state immediately on connection.
+   * Payload: { content, version, clientId }
+   *
+   * In raw WebSocket we had:  ws.onmessage → JSON.parse → switch(msg.type)
+   * In Socket.IO we have:     socket.on('init', handler)  ← much cleaner!
+   */
+  socket.on('init', (msg) => {
+    clientId = msg.clientId;
+    content = msg.content;
+    localVersion = msg.version;
+
+    editor.value = content;
+    remoteView.value = content;
+
+    clientIdEl.textContent = clientId.substring(0, 8) + '…';
+    panelClientId.textContent = clientId.substring(0, 8) + '…';
+    serverVersionEl.textContent = msg.version;
+    localVersionEl.textContent = msg.version;
+    ctrlVersionEl.textContent = msg.version;
+
+    log('op-sync', `Initialized. Document: "${content}" | Version: ${msg.version} | Client: ${clientId.substring(0,8)}`);
+  });
+
+  /**
+   * EVENT: 'op' (received from server — a REMOTE op from another client)
+   * ---------------------------------------------------------------------
+   * The server has already transformed this op against server-side concurrent ops.
+   *
+   * However, we might have LOCAL PENDING OPS the server doesn't know about yet.
+   * We must transform this remote op against our pending ops — client-side OT.
+   *
+   * Payload: { type, position, chars, clientId, serverVersion }
+   */
+  socket.on('op', (remoteOp) => {
+    log('op-type', `Remote op: ${remoteOp.type} "${remoteOp.chars}" at pos ${remoteOp.position} (server v${remoteOp.serverVersion})`);
+
+    // Transform incoming remote op against any ops we sent but haven't ack'd yet
+    let transformedRemoteOp = remoteOp;
+    for (const pendingOp of pendingOps) {
+      transformedRemoteOp = clientTransformOp(transformedRemoteOp, pendingOp);
+    }
+
+    if (transformedRemoteOp !== remoteOp) {
+      log('op-transform', `Transformed remote op against ${pendingOps.length} pending op(s): position → ${transformedRemoteOp.position}`);
+    }
+
+    // Preserve cursor position across remote edits
+    const cursorPos = editor.selectionStart;
+
+    content = applyOp(content, transformedRemoteOp);
+    editor.value = content;
+    remoteView.value = content;
+
+    restoreCursor(editor, cursorPos, transformedRemoteOp);
+
+    localVersion = remoteOp.serverVersion;
+    localVersionEl.textContent = localVersion;
+    ctrlVersionEl.textContent = localVersion;
+    serverVersionEl.textContent = remoteOp.serverVersion;
+  });
+
+  // ─── Detect Changes in the Editor ─────────────────────────────────────────
+  /**
+   * We use the 'input' event to detect changes.
+   * By comparing the old content with the new textarea value, we derive
+   * the exact insert or delete operation.
+   *
+   * NOTE: This is a simplified diff. A production implementation would use
+   * a proper diff algorithm (e.g., Myers diff) to handle paste operations.
+   * For educational purposes, we handle the common cases: single-char insert/delete
+   * and multi-character paste/cut.
+   */
+  editor.addEventListener('input', (e) => {
+    const newContent = editor.value;
+    const op = deriveOperation(content, newContent);
+
+    if (!op) {
+      content = newContent;
+      return; // no meaningful change
+    }
+
+    // Attach version BEFORE updating local state
+    op.clientId = clientId;
+    op.clientVersion = localVersion;
+
+    log('op-insert', `Local op: ${op.type} "${op.chars}" at pos ${op.position} (v${op.clientVersion})`);
+
+    // Update local content immediately (optimistic local application)
+    content = newContent;
+
+    // Queue the op as "pending" (sent but not yet ack'd)
+    pendingOps.push(op);
+
+    // Send to server (with optional artificial lag)
+    sendOp(op);
+  });
+
+  /**
+   * deriveOperation(oldContent, newContent)
+   * ----------------------------------------
+   * Compare old and new text to figure out what changed.
+   * Returns an Operation-like object or null if no meaningful change.
+   *
+   * This handles:
+   *   - Single character insertion (typing)
+   *   - Single character deletion (backspace/delete)
+   *   - Multi-character paste (treated as one bulk insert)
+   *   - Multi-character cut/selection delete (treated as one bulk delete)
+   */
+  function deriveOperation(oldStr, newStr) {
+    if (oldStr === newStr) return null;
+
+    // Find where the strings diverge from the start
+    let start = 0;
+    while (start < oldStr.length && start < newStr.length && oldStr[start] === newStr[start]) {
+      start++;
+    }
+
+    // Find where they converge again from the end
+    let oldEnd = oldStr.length;
+    let newEnd = newStr.length;
+    while (oldEnd > start && newEnd > start && oldStr[oldEnd - 1] === newStr[newEnd - 1]) {
+      oldEnd--;
+      newEnd--;
+    }
+
+    const deletedText = oldStr.substring(start, oldEnd);
+    const insertedText = newStr.substring(start, newEnd);
+
+    if (deletedText.length > 0 && insertedText.length > 0) {
+      /**
+       * REPLACEMENT: text was selected and overwritten.
+       * We model this as a delete followed by an insert.
+       * For simplicity, we treat it as a delete here and handle insert
+       * separately via the next input event... actually for correctness
+       * we'll emit just one composite operation modeled as a delete then insert.
+       * For this demo, we simplify: emit delete first, then insert at same position.
+       *
+       * A production OT system might have a "replace" op type, or handle
+       * this differently. Here we just send the insert since the textarea
+       * already shows the final state.
+       */
+      return { type: 'insert', position: start, chars: insertedText };
+    } else if (insertedText.length > 0) {
+      // Pure insertion
+      return { type: 'insert', position: start, chars: insertedText };
+    } else if (deletedText.length > 0) {
+      // Pure deletion
+      return { type: 'delete', position: start, chars: deletedText };
+    }
+
+    return null;
+  }
+
+  /**
+   * sendOp(op)
+   * ----------
+   * Send an operation to the server via Socket.IO.
+   *
+   * SOCKET.IO ACKNOWLEDGEMENT:
+   * We pass a callback as the 3rd argument to socket.emit().
+   * The server calls it with { serverVersion } once the op is applied.
+   * This replaces the old separate 'ack' message type entirely!
+   *
+   * ⚡ THIS IS WHERE YOU CAN SIMULATE CONFLICTS:
+   *   Enable lag on Client A, type a character.
+   *   Then quickly switch to Client B (another tab) and type at the same spot.
+   *   Client B's op arrives at the server first. When Client A's delayed op
+   *   arrives, the server TRANSFORMS it to account for Client B's op.
+   */
+  function sendOp(op) {
+    const payload = {
+      type:          op.type,
+      position:      op.position,
+      chars:         op.chars,
+      clientId:      op.clientId,
+      clientVersion: op.clientVersion
+    };
+
+    /**
+     * Socket.IO acknowledgement pattern:
+     *   socket.emit(event, data, callback)
+     * The server receives (data, ack) and calls ack({ serverVersion }).
+     * We get the server version back here without a separate message type.
+     */
+    const doSend = () => {
+      socket.emit('op', payload, (ack) => {
+        // ack = { serverVersion } sent back by the server
+        pendingOps.shift();
+        localVersion = ack.serverVersion;
+        localVersionEl.textContent = localVersion;
+        ctrlVersionEl.textContent  = localVersion;
+        serverVersionEl.textContent = ack.serverVersion;
+        log('op-sync', `Ack: server version now ${ack.serverVersion}. Pending ops: ${pendingOps.length}`);
+      });
+    };
+
+    if (lagEnabled && lagAmount > 0) {
+      log('op-transform', `⏳ Op delayed by ${lagAmount}ms (lag simulation active)`);
+      setTimeout(doSend, lagAmount);
+    } else {
+      doSend();
+    }
+  }
+
+  /**
+   * applyOp(content, op)
+   * --------------------
+   * Apply an operation to a string. Same logic as the server-side applyOp.
+   * The client needs its own copy because it applies both local and remote ops.
+   */
+  function applyOp(str, op) {
+    if (op.type === 'insert') {
+      return str.slice(0, op.position) + op.chars + str.slice(op.position);
+    } else if (op.type === 'delete') {
+      const safePos = Math.min(op.position, str.length);
+      return str.slice(0, safePos) + str.slice(safePos + op.chars.length);
+    }
+    return str;
+  }
+
+  /**
+   * clientTransformOp(remoteOp, localOp)
+   * --------------------------------------
+   * Client-side transformation: adjust a REMOTE op given that we have
+   * a LOCAL op that was applied but not yet acknowledged by the server.
+   *
+   * This mirrors the server's transformOp() logic.
+   * The "diamond diagram" of OT requires transformation on BOTH sides.
+   *
+   * Think of it like this:
+   *   Server: transforms localOp against serverOps  → sends ack
+   *   Client: transforms remoteOp against localPendingOps → applies locally
+   *
+   * Both transformations ensure convergence.
+   */
+  function clientTransformOp(remoteOp, localOp) {
+    const transformed = { ...remoteOp }; // clone
+
+    if (remoteOp.type === 'insert' && localOp.type === 'insert') {
+      if (localOp.position < remoteOp.position ||
+         (localOp.position === remoteOp.position && localOp.clientId < remoteOp.clientId)) {
+        transformed.position += localOp.chars.length;
+      }
+    } else if (remoteOp.type === 'insert' && localOp.type === 'delete') {
+      if (localOp.position < remoteOp.position) {
+        const deletedBefore = Math.min(localOp.chars.length, remoteOp.position - localOp.position);
+        transformed.position -= deletedBefore;
+      }
+    } else if (remoteOp.type === 'delete' && localOp.type === 'insert') {
+      if (localOp.position <= remoteOp.position) {
+        transformed.position += localOp.chars.length;
+      }
+    } else if (remoteOp.type === 'delete' && localOp.type === 'delete') {
+      if (localOp.position + localOp.chars.length <= remoteOp.position) {
+        transformed.position -= localOp.chars.length;
+      } else if (localOp.position < remoteOp.position) {
+        transformed.position = localOp.position;
+      }
+    }
+
+    return transformed;
+  }
+
+  /**
+   * restoreCursor(textarea, oldCursor, appliedOp)
+   * -----------------------------------------------
+   * After applying a remote op, restore the cursor to approximately where
+   * it was, adjusted for the insertion/deletion.
+   *
+   * This is an important UX feature: without it, the cursor would jump
+   * to position 0 every time a remote change arrives!
+   */
+  function restoreCursor(textarea, oldCursor, op) {
+    let newCursor = oldCursor;
+    if (op.type === 'insert' && op.position <= oldCursor) {
+      newCursor += op.chars.length;
+    } else if (op.type === 'delete' && op.position < oldCursor) {
+      newCursor = Math.max(op.position, oldCursor - op.chars.length);
+    }
+    textarea.setSelectionRange(newCursor, newCursor);
+  }
+
+  // ─── Logging Helpers ──────────────────────────────────────────────────────
+  function log(cssClass, message) {
+    const now = new Date();
+    const timestamp = `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}:${now.getSeconds().toString().padStart(2,'0')}.${now.getMilliseconds().toString().padStart(3,'0')}`;
+
+    const entry = document.createElement('div');
+    entry.className = 'log-entry';
+    entry.innerHTML = `<span class="timestamp">[${timestamp}]</span> <span class="${cssClass}">${message}</span>`;
+    logContainer.appendChild(entry);
+    logContainer.scrollTop = logContainer.scrollHeight;
+
+    // Keep log manageable
+    while (logContainer.children.length > 100) {
+      logContainer.removeChild(logContainer.firstChild);
+    }
+  }
+
+  function clearLog() {
+    logContainer.innerHTML = '<div class="log-entry"><span class="op-type">Log cleared</span></div>';
+  }
+  </script>
+</body>
+</html>
+

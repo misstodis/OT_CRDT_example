@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CRDT Demo — Logoot</title>
+  <link rel="stylesheet" href="/shared.css" />
+  <style>
+    textarea:focus {
+      border-color: #059669 !important;
+      box-shadow: 0 0 0 3px rgba(5, 150, 105, 0.12) !important;
+    }
+  </style>
+</head>
+<body>
+  <!-- ── Header ──────────────────────────────────────────────────────────── -->
+  <header>
+    <span class="badge badge-crdt">CRDT</span>
+    <div>
+      <h1>CRDT Demo — Logoot Sequence</h1>
+      <div class="subtitle">
+        <a href="/" class="back-link">← Back to Home</a>
+        &nbsp;·&nbsp; Open this page in multiple browser tabs to test collaborative editing
+      </div>
+    </div>
+  </header>
+
+  <!-- ── Status Bar ──────────────────────────────────────────────────────── -->
+  <div class="status-bar">
+    <span>
+      <span class="status-dot" id="status-dot"></span>
+      <span id="status-text">Connecting…</span>
+    </span>
+    <span>Site ID: <code id="site-id">—</code></span>
+    <span>Local clock: <code id="local-clock">0</code></span>
+    <span>Document length: <code id="doc-length">0</code> chars</span>
+    <span>Entries in CRDT: <code id="entry-count">0</code></span>
+  </div>
+
+  <!-- ── Main Grid ─────────────────────────────────────────────────────── -->
+  <div class="main-grid" style="grid-template-rows: auto auto auto;">
+
+    <!-- Explanation box -->
+    <div class="explanation-box" style="grid-column: 1 / -1;">
+      <strong>How CRDT (Logoot) works:</strong>
+      Each character is stored as <em>{ id: LogootID, char }</em> where the ID is a unique
+      floating-point position between 0 and 1 (plus site ID and clock as tie-breakers).
+      The document is a <strong>sorted array of these pairs</strong> — all clients sort by the same
+      ordering rule, so they <strong>automatically converge</strong> without any server-side transformation.
+      The server is just a <strong>dumb relay</strong> — it broadcasts operations without transforming them.
+    </div>
+
+    <!-- ── Editor Panel ─────────────────────────────────────────────────── -->
+    <div class="client-panel crdt-demo">
+      <div class="panel-header">
+        <h3>📝 This Client (You)</h3>
+        <span class="client-info" id="panel-site-id">Connecting…</span>
+      </div>
+      <div class="editor-area">
+        <textarea
+          id="editor"
+          placeholder="Start typing here… Open another tab to test concurrent editing!"
+          spellcheck="false"
+        ></textarea>
+      </div>
+      <div class="controls">
+        <label class="toggle-label">
+          <input type="checkbox" id="lag-toggle" />
+          Simulate network lag
+        </label>
+        <div style="display:flex;align-items:center;gap:0.5rem;font-size:0.78rem;color:#94a3b8;">
+          Delay: <input type="range" id="lag-amount" min="0" max="3000" step="100" value="500" style="width:90px;accent-color:#f59e0b;" />
+          <span id="lag-display">500ms</span>
+        </div>
+        <span class="version-badge">clock: <span id="ctrl-clock">0</span></span>
+      </div>
+    </div>
+
+    <!-- ── CRDT State Inspector ─────────────────────────────────────────── -->
+    <div class="client-panel crdt-demo">
+      <div class="panel-header">
+        <h3>🔍 CRDT State Inspector</h3>
+        <span class="client-info">Internal ID array</span>
+      </div>
+      <div class="editor-area" style="padding: 0.5rem;">
+        <div style="font-size: 0.72rem; color: #64748b; padding: 0.5rem; border-bottom: 1px solid #334155;">
+          Each row = one character + its Logoot ID. IDs are sorted so the document
+          is always consistent across all clients.
+        </div>
+        <div id="crdt-inspector" style="
+          flex: 1;
+          overflow-y: auto;
+          font-family: 'Courier New', monospace;
+          font-size: 0.72rem;
+          padding: 0.5rem;
+          color: #64748b;
+        ">
+          <div style="color: #475569;">Waiting for first character…</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Operation Log ─────────────────────────────────────────────────── -->
+    <div class="log-panel" style="grid-column: 1 / -1;">
+      <div class="panel-header">
+        <h3>📡 Operation Log — No Transformation Needed!</h3>
+        <button class="clear-btn" onclick="clearLog()">Clear</button>
+      </div>
+      <div id="log-container">
+        <div class="log-entry">
+          <span class="op-crdt">CRDT ENGINE READY</span>
+          — waiting for operations…
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!--
+    Socket.IO client library.
+    Served automatically by the Socket.IO server at /socket.io/socket.io.js
+    Must be loaded BEFORE the inline script that calls io().
+  -->
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+  /**
+   * crdt.html — Client-Side CRDT (Logoot) Implementation (Socket.IO edition)
+   * ==========================================================================
+   *
+   * CRDT CLIENT RESPONSIBILITIES:
+   * ------------------------------
+   * 1. Maintain a sorted array of { id: LogootID, char } entries
+   * 2. On user insert: generate a new unique LogootID between neighbours
+   * 3. On user delete: find the LogootID of the deleted character and send delete
+   * 4. Receive remote inserts/deletes and apply them to the local CRDT state
+   * 5. Render the CRDT state as a plain string into the textarea
+   *
+   * KEY DIFFERENCES FROM OT:
+   * -------------------------
+   * - NO version numbers needed
+   * - NO transformation of operations
+   * - Operations can arrive in ANY ORDER (commutativity)
+   * - Applying the same operation twice is safe (idempotency)
+   * - Server is just a relay — it doesn't understand operations
+   *
+   * THE LOGOOT ID:
+   * --------------
+   * Each character's ID is a tuple [position: float, siteId: string, clock: int]
+   * Positions are allocated as the MIDPOINT between the left and right neighbours,
+   * with random jitter to reduce collision probability.
+   *
+   * CONFLICT EXAMPLE:
+   *   Document: "He_lo" (underscore = empty space)
+   *   Client A inserts "l" at the gap → id = [0.6, "A", 1]
+   *   Client B inserts "p" at the gap → id = [0.6, "B", 1]  (same float position!)
+   *
+   *   Tie-breaking: "A" < "B" alphabetically → A's char comes first
+   *   Result: "He" + A's "l" + B's "p" + "lo" = "Heplо" — deterministic on ALL clients!
+   */
+
+  // ─── LogootID implementation (mirrored from server) ──────────────────────
+  /**
+   * LogootID — a sortable, unique position identifier
+   * This is a CLIENT-SIDE copy of the server's logoot-id.js
+   */
+  class LogootID {
+    constructor(position, siteId, clock) {
+      this.position = position;
+      this.siteId = siteId;
+      this.clock = clock;
+    }
+
+    compare(other) {
+      if (this.position !== other.position) return this.position - other.position;
+      if (this.siteId !== other.siteId) return this.siteId < other.siteId ? -1 : 1;
+      return this.clock - other.clock;
+    }
+
+    equals(other) {
+      return this.position === other.position &&
+             this.siteId === other.siteId &&
+             this.clock === other.clock;
+    }
+
+    toJSON() {
+      return { position: this.position, siteId: this.siteId, clock: this.clock };
+    }
+
+    static fromJSON(obj) {
+      return new LogootID(obj.position, obj.siteId, obj.clock);
+    }
+  }
+
+  // ─── LogootDocument implementation (mirrored from server) ────────────────
+  /**
+   * LogootDocument — the sorted array of {id, char} entries
+   * This is a CLIENT-SIDE copy of the server's logoot-document.js
+   */
+  class LogootDocument {
+    constructor() {
+      this.entries = [];      // sorted array of { id: LogootID, char: string }
+      this.deletedIds = new Set(); // tombstone set for out-of-order deletes
+    }
+
+    insert(id, char) {
+      const idKey = `${id.position}:${id.siteId}:${id.clock}`;
+      if (this.deletedIds.has(idKey)) return; // already deleted
+
+      for (const entry of this.entries) {
+        if (entry.id.equals(id)) return; // duplicate, skip (idempotency)
+      }
+
+      const index = this._findInsertIndex(id);
+      this.entries.splice(index, 0, { id, char });
+    }
+
+    delete(id) {
+      const idKey = `${id.position}:${id.siteId}:${id.clock}`;
+      this.deletedIds.add(idKey);
+      const index = this.entries.findIndex(e => e.id.equals(id));
+      if (index !== -1) this.entries.splice(index, 1);
+    }
+
+    toString() {
+      return this.entries.map(e => e.char).join('');
+    }
+
+    getEntries() {
+      return this.entries.map(e => ({ id: e.id.toJSON(), char: e.char }));
+    }
+
+    generateIDBetween(leftIndex, rightIndex, siteId, clock) {
+      const leftId = leftIndex >= 0 ? this.entries[leftIndex].id : null;
+      const rightId = rightIndex < this.entries.length ? this.entries[rightIndex].id : null;
+
+      // Boundary positions
+      const leftPos = leftId ? leftId.position : 0;
+      const rightPos = rightId ? rightId.position : 1;
+
+      // Midpoint with jitter
+      let newPos = (leftPos + rightPos) / 2;
+      const gap = rightPos - leftPos;
+      const jitter = (Math.random() - 0.5) * (gap / 4);
+      newPos += jitter;
+      newPos = Math.max(leftPos + Number.EPSILON, Math.min(rightPos - Number.EPSILON, newPos));
+
+      return new LogootID(newPos, siteId, clock);
+    }
+
+    _findInsertIndex(id) {
+      let lo = 0, hi = this.entries.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (this.entries[mid].id.compare(id) < 0) lo = mid + 1;
+        else hi = mid;
+      }
+      return lo;
+    }
+
+    reset() {
+      this.entries = [];
+      this.deletedIds = new Set();
+    }
+  }
+
+  // ─── Application State ────────────────────────────────────────────────────
+  const doc = new LogootDocument(); // our local CRDT document
+
+  let siteId = null;         // our unique site identifier (assigned by server)
+  let clock = 0;             // Lamport-style local clock (incremented on each insert)
+  let localContent = '';     // rendered string of the CRDT (for diff detection)
+  let isApplyingRemote = false; // guard to prevent re-sending remote ops
+
+  let lagEnabled = false;
+  let lagAmount = 500;
+
+  // DOM
+  const editor = document.getElementById('editor');
+  const statusDot = document.getElementById('status-dot');
+  const statusText = document.getElementById('status-text');
+  const siteIdEl = document.getElementById('site-id');
+  const panelSiteId = document.getElementById('panel-site-id');
+  const localClockEl = document.getElementById('local-clock');
+  const docLengthEl = document.getElementById('doc-length');
+  const entryCountEl = document.getElementById('entry-count');
+  const ctrlClockEl = document.getElementById('ctrl-clock');
+  const logContainer = document.getElementById('log-container');
+  const crdtInspector = document.getElementById('crdt-inspector');
+
+  // ─── Lag controls ─────────────────────────────────────────────────────────
+  document.getElementById('lag-toggle').addEventListener('change', (e) => {
+    lagEnabled = e.target.checked;
+    log('op-crdt', `Network lag simulation ${lagEnabled ? 'ENABLED' : 'DISABLED'} (${lagAmount}ms)`);
+  });
+  document.getElementById('lag-amount').addEventListener('input', (e) => {
+    lagAmount = parseInt(e.target.value);
+    document.getElementById('lag-display').textContent = lagAmount + 'ms';
+  });
+
+  // ─── Socket.IO Connection ─────────────────────────────────────────────────
+  /**
+   * We connect to the '/crdt' NAMESPACE.
+   * The CRDT namespace is a dumb relay — the server just forwards events.
+   *
+   * Socket.IO events used:
+   *   socket.on('init',   handler)   → server sends current document state
+   *   socket.on('insert', handler)   → remote client inserted a character
+   *   socket.on('delete', handler)   → remote client deleted a character
+   *   socket.emit('insert', payload) → we inserted a character
+   *   socket.emit('delete', payload) → we deleted a character
+   *
+   * Compare with raw WebSocket where everything went through ws.onmessage
+   * and required JSON.parse + switch(msg.type).
+   * Socket.IO gives us clean named events instead!
+   */
+  const socket = io('/crdt');   // ← replaces: new WebSocket('ws://host/ws/crdt')
+
+  socket.on('connect', () => {
+    statusDot.classList.add('connected');
+    statusText.textContent = 'Connected';
+    log('op-sync', `Socket.IO connected to /crdt namespace. Socket ID: ${socket.id}`);
+  });
+
+  socket.on('disconnect', (reason) => {
+    statusDot.classList.remove('connected');
+    statusText.textContent = 'Disconnected';
+    log('op-delete', `Socket.IO disconnected: ${reason}`);
+  });
+
+  // ─── Receive Events from Server ───────────────────────────────────────────
+
+  /**
+   * EVENT: 'init'
+   * Server sends the full CRDT state on connection.
+   * Payload: { entries: [{id, char}, ...], clientId }
+   */
+  socket.on('init', (msg) => {
+    siteId = msg.clientId;
+    siteIdEl.textContent = siteId.substring(0, 8) + '…';
+    panelSiteId.textContent = siteId.substring(0, 8) + '…';
+
+    doc.reset();
+    for (const entry of msg.entries) {
+      const id = LogootID.fromJSON(entry.id);
+      doc.insert(id, entry.char);
+    }
+
+    localContent = doc.toString();
+    isApplyingRemote = true;
+    editor.value = localContent;
+    isApplyingRemote = false;
+
+    updateStats();
+    updateInspector();
+    log('op-crdt', `Initialized with ${msg.entries.length} entries. Content: "${localContent}" | Site: ${siteId.substring(0,8)}`);
+  });
+
+  /**
+   * EVENT: 'insert' (from a remote client, relayed by server)
+   * ----------------------------------------------------------
+   * Payload: { id: LogootID, char }
+   *
+   * CRDT MAGIC: No transformation needed.
+   * We simply insert the (id, char) into our sorted array.
+   * Because IDs are totally ordered, it lands in the exact same position
+   * as on every other client — AUTOMATICALLY!
+   */
+  socket.on('insert', (msg) => {
+    const id = LogootID.fromJSON(msg.id);
+    log('op-crdt', `Remote insert "${msg.char}" [pos=${id.position.toFixed(6)}, site=${id.siteId.substring(0,8)}, clock=${id.clock}]`);
+
+    isApplyingRemote = true;
+    doc.insert(id, msg.char);
+    const newContent = doc.toString();
+    editor.value = newContent;
+    localContent = newContent;
+    isApplyingRemote = false;
+
+    updateStats();
+    updateInspector();
+  });
+
+  /**
+   * EVENT: 'delete' (from a remote client, relayed by server)
+   * ----------------------------------------------------------
+   * Payload: { id: LogootID }
+   *
+   * Delete by stable ID — no position arithmetic, unlike OT.
+   */
+  socket.on('delete', (msg) => {
+    const id = LogootID.fromJSON(msg.id);
+    log('op-crdt', `Remote delete [pos=${id.position.toFixed(6)}, site=${id.siteId.substring(0,8)}, clock=${id.clock}]`);
+
+    isApplyingRemote = true;
+    doc.delete(id);
+    const newContent = doc.toString();
+    editor.value = newContent;
+    localContent = newContent;
+    isApplyingRemote = false;
+
+    updateStats();
+    updateInspector();
+  });
+
+  // ─── Detect Local Changes ─────────────────────────────────────────────────
+  editor.addEventListener('input', () => {
+    if (isApplyingRemote) return; // don't process changes we applied ourselves
+
+    const newContent = editor.value;
+
+    /**
+     * DIFFING:
+     * We compare localContent (the last known CRDT render) with newContent
+     * (what the user just typed) to find what changed.
+     *
+     * We find the divergence point (start) and convergence point (end)
+     * to identify inserted/deleted text — same approach as the OT client.
+     */
+    let start = 0;
+    while (start < localContent.length && start < newContent.length &&
+           localContent[start] === newContent[start]) start++;
+
+    let oldEnd = localContent.length;
+    let newEnd = newContent.length;
+    while (oldEnd > start && newEnd > start &&
+           localContent[oldEnd - 1] === newContent[newEnd - 1]) { oldEnd--; newEnd--; }
+
+    const deletedText = localContent.substring(start, oldEnd);
+    const insertedText = newContent.substring(start, newEnd);
+
+    /**
+     * HANDLE DELETIONS:
+     * For each deleted character, find its LogootID in the entries array
+     * (using the index that maps to the rendered position) and send a delete op.
+     *
+     * In a full implementation we'd use a more robust mapping.
+     * Here we use the position in the sorted entries array which corresponds
+     * to the position in the rendered string.
+     */
+    if (deletedText.length > 0) {
+      for (let i = start + deletedText.length - 1; i >= start; i--) {
+        if (i < doc.entries.length) {
+          const entry = doc.entries[i];
+          const id = entry.id;
+
+          log('op-delete', `Local delete at index ${i}, char "${entry.char}", ID [pos=${id.position.toFixed(6)}, clock=${id.clock}]`);
+
+          // Remove from local CRDT immediately
+          doc.delete(id);
+
+          // Send delete op to server (which relays it to other clients)
+          sendMsg('delete', { id: id.toJSON() });
+        }
+      }
+    }
+
+    /**
+     * HANDLE INSERTIONS:
+     * For each inserted character, generate a new LogootID positioned between
+     * its left and right neighbours in the document.
+     *
+     * We increment the clock for each insertion to keep IDs unique.
+     */
+    if (insertedText.length > 0) {
+      for (let i = 0; i < insertedText.length; i++) {
+        const char = insertedText[i];
+        const insertPos = start + i; // position in the updated CRDT array
+
+        /**
+         * Find left and right neighbours in the current entries array.
+         * Since we may have already inserted chars in this loop,
+         * the entries array is updated after each insert.
+         *
+         * leftIndex = insertPos - 1  (the character just to the left)
+         * rightIndex = insertPos     (the character currently at this position, which will shift right)
+         */
+        const leftIndex = insertPos - 1;
+        const rightIndex = insertPos;
+
+        clock++; // increment our Lamport clock
+
+        /**
+         * GENERATE ID:
+         * This is the core CRDT operation — create a unique, ordered ID
+         * for this new character by picking a position between the neighbours.
+         */
+        const newId = doc.generateIDBetween(leftIndex, rightIndex, siteId, clock);
+
+        log('op-insert', `Local insert "${char}" at index ${insertPos}, new ID [pos=${newId.position.toFixed(6)}, site=${newId.siteId.substring(0,8)}, clock=${newId.clock}]`);
+        log('op-crdt', `ID allocation: left=${leftIndex >= 0 ? doc.entries[leftIndex].id.position.toFixed(6) : '0.0'}, right=${rightIndex < doc.entries.length ? doc.entries[rightIndex].id.position.toFixed(6) : '1.0'} → new=${newId.position.toFixed(6)}`);
+
+        // Insert into local CRDT
+        doc.insert(newId, char);
+
+        // Broadcast to other clients via server
+        sendMsg('insert', { id: newId.toJSON(), char });
+      }
+    }
+
+    localContent = doc.toString();
+
+    // Sync the textarea with the CRDT state (might differ if jitter moved a char)
+    // In most cases this won't change anything, but it ensures correctness
+    if (editor.value !== localContent) {
+      const cursor = editor.selectionStart;
+      editor.value = localContent;
+      editor.setSelectionRange(cursor, cursor);
+    }
+
+    updateStats();
+    updateInspector();
+  });
+
+  /**
+   * sendMsg(eventName, payload)
+   * ---------------------------
+   * Send a CRDT event to the server via Socket.IO.
+   *
+   * Socket.IO uses NAMED EVENTS — socket.emit('insert', data) — instead of
+   * the raw WebSocket pattern of ws.send(JSON.stringify({ type:'insert', ...})).
+   * The server listens with socket.on('insert', handler).
+   *
+   * ⚡ TRY THIS: Enable lag in two different tabs, then type at the same
+   * position simultaneously. The CRDT will correctly merge both inserts
+   * using ID ordering — no conflicts, no server transformation!
+   */
+  function sendMsg(eventName, payload) {
+    if (lagEnabled && lagAmount > 0) {
+      log('op-transform', `⏳ Op delayed by ${lagAmount}ms (lag simulation active)`);
+      setTimeout(() => socket.emit(eventName, payload), lagAmount);
+    } else {
+      socket.emit(eventName, payload);
+    }
+  }
+
+  // ─── UI Helpers ───────────────────────────────────────────────────────────
+  function updateStats() {
+    localClockEl.textContent = clock;
+    ctrlClockEl.textContent = clock;
+    docLengthEl.textContent = doc.entries.length;
+    entryCountEl.textContent = doc.entries.length;
+  }
+
+  /**
+   * updateInspector()
+   * -----------------
+   * Show the internal CRDT state: the sorted array of (ID, char) pairs.
+   * This is educational — you can watch the IDs being allocated between neighbours!
+   */
+  function updateInspector() {
+    if (doc.entries.length === 0) {
+      crdtInspector.innerHTML = '<div style="color: #475569;">No characters yet…</div>';
+      return;
+    }
+
+    const rows = doc.entries.map((entry, i) => {
+      const id = entry.id;
+      const isMine = id.siteId === siteId;
+      const color = isMine ? '#34d399' : '#7dd3fc';
+      return `<div style="padding: 2px 0; border-bottom: 1px solid #1e293b; display: flex; gap: 8px;">
+        <span style="color: #475569; min-width: 24px;">${i}</span>
+        <span style="color: ${color}; font-weight: bold;">"${escapeHtml(entry.char)}"</span>
+        <span style="color: #64748b;">pos=${id.position.toFixed(8)}</span>
+        <span style="color: #475569;">site=${id.siteId.substring(0, 6)}…</span>
+        <span style="color: #475569;">clock=${id.clock}</span>
+        ${isMine ? '<span style="color: #34d399;">(mine)</span>' : '<span style="color: #7dd3fc;">(remote)</span>'}
+      </div>`;
+    }).join('');
+
+    crdtInspector.innerHTML = rows;
+  }
+
+  function escapeHtml(str) {
+    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function log(cssClass, message) {
+    const now = new Date();
+    const ts = `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}:${now.getSeconds().toString().padStart(2,'0')}.${now.getMilliseconds().toString().padStart(3,'0')}`;
+    const entry = document.createElement('div');
+    entry.className = 'log-entry';
+    entry.innerHTML = `<span class="timestamp">[${ts}]</span> <span class="${cssClass}">${message}</span>`;
+    logContainer.appendChild(entry);
+    logContainer.scrollTop = logContainer.scrollHeight;
+    while (logContainer.children.length > 100) logContainer.removeChild(logContainer.firstChild);
+  }
+
+  function clearLog() {
+    logContainer.innerHTML = '<div class="log-entry"><span class="op-crdt">Log cleared</span></div>';
+  }
+  </script>
+</body>
+</html>
+
